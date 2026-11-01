@@ -1,0 +1,205 @@
+name: polygon-image-platform
+
+x-spark-image: &spark-image apache/spark:4.0.5-scala2.13-java21-python3-ubuntu
+
+services:
+  spark-master:
+    image: *spark-image
+    profiles: [batch, stream, full]
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "127.0.0.1:7077:7077"
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import socket; socket.create_connection((\"spark-master\", 7077), timeout=2).close()'"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+    mem_limit: 768m
+    restart: unless-stopped
+
+  spark-worker:
+    image: *spark-image
+    profiles: [batch, stream, full]
+    hostname: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "1", "--memory", "1g", "--webui-port", "8081"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8082:8081"
+    volumes:
+      - spark-worker-data:/opt/spark/work
+      - ./data:/opt/airflow/data
+      - ./data:/opt/project/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import socket; socket.create_connection((\"spark-worker\", 8081), timeout=2).close()'"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+    mem_limit: 1280m
+    restart: unless-stopped
+
+  spark-app:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    image: polygon-spark-app:4.0.5
+    profiles: [batch, stream]
+    working_dir: /opt/project
+    command: ["bash", "-lc", "tail -f /dev/null"]
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_DRIVER_HOST: spark-app
+      PYSPARK_PYTHON: python3
+      PYTHONPATH: /opt/project
+    volumes:
+      - ./:/opt/project
+      - ${HOME}/.aws:/root/.aws:ro
+      - spark-ivy-cache:/home/spark/.ivy2
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      spark-worker:
+        condition: service_healthy
+    mem_limit: 2g
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:4.2.2
+    profiles: [stream, full]
+    hostname: kafka
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,CONTROLLER://:29093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "127.0.0.1:9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 8s
+      retries: 15
+    mem_limit: 1g
+    restart: unless-stopped
+
+  airflow-db:
+    image: postgres:16.15-bookworm
+    profiles: [airflow, full]
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    restart: unless-stopped
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+      args:
+        AIRFLOW_VERSION: 3.3.2
+    image: polygon-airflow:3.3.2-python3.10
+    profiles: [airflow, full]
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment: &airflow-environment
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD}@airflow-db/airflow
+      AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY}
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_API_SECRET_KEY}
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+      DATASET_ZIP: ${DATASET_ZIP:-/opt/airflow/data/raw/polygon_dataset.zip}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-polygon-image-platform}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_PROFILE: ${AWS_PROFILE:-}
+      SPARK_DRIVER_HOST: airflow-scheduler
+      PYSPARK_SUBMIT_ARGS: --driver-memory 512m pyspark-shell
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-local[2]}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:29092}
+    volumes: &airflow-volumes
+      - ./dags:/opt/airflow/dags:ro
+      - ./scripts:/opt/airflow/scripts:ro
+      - ./src:/opt/airflow/src:ro
+      - ./data:/opt/airflow/data
+      - ./logs:/opt/airflow/logs
+      - ${HOME}/.aws:/home/airflow/.aws:ro
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    command: ["bash", "-c", "airflow db migrate"]
+    restart: "no"
+    mem_limit: 1g
+
+  airflow-api-server:
+    image: polygon-airflow:3.3.2-python3.10
+    profiles: [airflow, full]
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment: *airflow-environment
+    volumes: *airflow-volumes
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: ["api-server"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    mem_limit: 1g
+    restart: unless-stopped
+
+  airflow-scheduler:
+    image: polygon-airflow:3.3.2-python3.10
+    profiles: [airflow, full]
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment: *airflow-environment
+    volumes: *airflow-volumes
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: ["scheduler"]
+    mem_limit: 1g
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    image: polygon-airflow:3.3.2-python3.10
+    profiles: [airflow, full]
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment: *airflow-environment
+    volumes: *airflow-volumes
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: ["dag-processor"]
+    mem_limit: 512m
+    restart: unless-stopped
+
+volumes:
+  airflow-db-data:
+  kafka-data:
+  spark-worker-data:
+  spark-ivy-cache:

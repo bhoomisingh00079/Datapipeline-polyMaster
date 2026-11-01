@@ -1,0 +1,26 @@
+# Local datasets and generated pipeline outputs
+/data/raw/*
+/data/staging/*
+/data/processed/*
+/outputs/*
+logs/
+!/data/raw/.gitkeep
+!/data/staging/.gitkeep
+!/data/processed/.gitkeep
+!/outputs/.gitkeep
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+.ipynb_checkpoints/

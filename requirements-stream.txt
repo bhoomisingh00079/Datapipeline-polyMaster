@@ -1,0 +1,2 @@
+# Pure-Python Kafka client for the optional producer.
+kafka-python==3.0.12

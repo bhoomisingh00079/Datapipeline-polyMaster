@@ -1,0 +1,3 @@
+# Optional local Spark batch/Delta profile; install only after Java 17 or 21 is selected.
+pyspark==4.0.5
+delta-spark==4.0.1
